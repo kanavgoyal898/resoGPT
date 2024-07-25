@@ -4,6 +4,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+import tiktoken
+
 # --------------------------------------------------------------------------------------------------------------------------------
 
 @dataclass
@@ -100,7 +102,7 @@ class GPT(nn.Module):
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)  # language modelling head
 
-    def forward(self, idx):
+    def forward(self, idx, targets=None):
         # idx is of shape (B, T)
         B, T = idx.shape
         assert T <= self.config.block_size, f'cannot forward sequence of length {T}, block size is only {self.config.block_size}'
@@ -118,7 +120,10 @@ class GPT(nn.Module):
         # forward the final layernorm and the classifier
         x = self.transformer.ln_f(x)
         logits = self.lm_head(x)                                        # (B, T, vocab_size)
-        return logits
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+        return logits, loss
 
     @classmethod
     def from_pretrained(cls, model_type):
@@ -175,28 +180,75 @@ class GPT(nn.Module):
     
 # --------------------------------------------------------------------------------------------------------------------------------
 
-max_length = 24
-model_type = 'gpt2'
-num_return_sequences = 8
-device = 'mps' if torch.backends.mps.is_available() else 'cpu'
+class DataLoader:
 
-model = GPT.from_pretrained(model_type)
-print(f'successfully loaded weights from pretrained gpt: {model_type}')
+    def __init__(self, B, T):
+        self.B = B
+        self.T = T
+
+        # load tokens from disk and store them in memory
+        with open('tiny_shakespeare.txt', 'r') as f:
+            text = f.read()
+        
+        enc = tiktoken.get_encoding(model_type)
+        tokens = enc.encode(text)
+        self.tokens = torch.tensor(tokens)
+        print(f'loaded {len(self.tokens)} tokens (i.e., {len(self.tokens) // (B*T)} batches per epoch)')
+
+        # state
+        self.current_position = 0
+
+    def next_batch(self):
+        buf = self.tokens[self.current_position:self.current_position + (self.B*self.T) + 1]
+        x = buf[:-1].view(self.B, self.T)   # inputs
+        y = buf[1:].view(self.B, self.T)    # targets
+        # advance the position in the tensor
+        self.current_position += self.B*self.T
+        # if the next batch would be out of bounds, reset
+        if self.current_position + (self.B*self.T) + 1 > len(self.tokens):
+            self.current_position = 0
+        return x, y
+    
+# --------------------------------------------------------------------------------------------------------------------------------
+
+model_type = 'gpt2'
+
+# auto-device detection
+device = 'cpu'
+if torch.cuda.is_available():
+    device = 'cuda'
+elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+    device = 'mps'
+print(f'using device: {device}')
+
+config = GPTConfig()
+model = GPT(config)
+train_loader = DataLoader(4, 32)
 
 model.eval()
 model.to(device)
 
-# prefix tokens
-import tiktoken
-enc = tiktoken.get_encoding(model_type)
-tokens = enc.encode('hello, world')
-tokens = torch.tensor(tokens, dtype=torch.long)                 # (T, )
-tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)    # (num_return_sequences, T)
-x = tokens.to(device)
+# optimize
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+for i in range(50):
+    x, y = train_loader.next_batch()
+    x, y = x.to(device), y.to(device)
+    
+    optimizer.zero_grad(set_to_none=True)
+    logits, loss = model(x, y)
+    loss.backward()
+    optimizer.step()
+    print(f'step {i+1:2d}, loss: {loss.item():.4f}')
+
+import sys
+sys.exit(0)
 
 # generate
 torch.manual_seed(2147483647)
 torch.mps.manual_seed(2147483647)
+
+max_length = 24
+num_return_sequences = 8
 
 while x.size(1) < max_length:
     # forward the model to get logits
