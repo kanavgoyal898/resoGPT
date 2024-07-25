@@ -4,6 +4,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# --------------------------------------------------------------------------------------------------------------------------------
+
 @dataclass
 class GPTConfig:
     block_size: int = 1024      # maximum sequence length
@@ -35,7 +37,7 @@ class CausalSelfAttention(nn.Module):
         # e.g. in GPT-2 (124M), n_head=12, hs=64 so, nh*hs=C=768 channels in the transformer 
 
         # calculate query, key, value for all heads in batch and move head to be a batch dimension
-        qkv = self.attn(x)
+        qkv = self.c_attn(x)
         q, k, v = qkv.split(self.n_embd, dim=-1)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)         # (B, nh, T, hs)
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)         # (B, nh, T, hs)
@@ -43,7 +45,7 @@ class CausalSelfAttention(nn.Module):
 
         # attention weights (materializes the large (T, T) matrix for all the queries and keys)
         att = q @ k.transpose(-2, -1) * (1.0 / k.size(-1)**0.5)
-        att = torch.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
+        att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
         att = F.softmax(att, dim=-1)
 
         y = att @ v                                                             # (B, nh, T, hs)
@@ -93,10 +95,30 @@ class GPT(nn.Module):
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),               # weights for token embeddings
             wpe = nn.Embedding(config.block_size, config.n_embd),               # weights for positional embeddings
-            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),         # hidden blocks
+            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),  # hidden blocks
             ln_f = nn.LayerNorm(config.n_embd),                                 # layer normalization
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)  # language modelling head
+
+    def forward(self, idx):
+        # idx is of shape (B, T)
+        B, T = idx.shape
+        assert T <= self.config.block_size, f'cannot forward sequence of length {T}, block size is only {self.config.block_size}'
+
+        # forward the token and position embeddings
+        pos = torch.arange(0, T, dtype=torch.long, device=idx.device)   # (T, ): positions shape
+        pos_emb = self.transformer.wpe(pos)                             # (T, n_embd): position embeddings shape
+        tok_emb = self.transformer.wte(idx)                             # (B, T, n_embd): token embeddings shape
+        x = tok_emb + pos_emb
+
+        # forward the blocks of the transformer
+        for block in self.transformer.h:
+            x = block(x)
+
+        # forward the final layernorm and the classifier
+        x = self.transformer.ln_f(x)
+        logits = self.lm_head(x)                                        # (B, T, vocab_size)
+        return logits
 
     @classmethod
     def from_pretrained(cls, model_type):
@@ -136,7 +158,7 @@ class GPT(nn.Module):
 
         # basically, the openAI checkpoints use a 'Conv1D' module, but we want to use a vanilla Linear
         # this means that we have to transpose these weights when we import them
-        transposed = ['attn.c_attn.weight', 'attn.c_attn.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
+        transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
         for k in sd_keys_hf:
             if any(k.endswith(w) for w in transposed):
                 # special treatment for the Conv1D weights, we need to transpose
@@ -150,8 +172,52 @@ class GPT(nn.Module):
                     sd[k].copy_(sd_hf[k])
         
         return model
+    
+# --------------------------------------------------------------------------------------------------------------------------------
 
+max_length = 24
 model_type = 'gpt2'
+num_return_sequences = 8
+device = 'mps' if torch.backends.mps.is_available() else 'cpu'
+
 model = GPT.from_pretrained(model_type)
 print(f'successfully loaded weights from pretrained gpt: {model_type}')
-        
+
+model.eval()
+model.to(device)
+
+# prefix tokens
+import tiktoken
+enc = tiktoken.get_encoding(model_type)
+tokens = enc.encode('hello, world')
+tokens = torch.tensor(tokens, dtype=torch.long)                 # (T, )
+tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)    # (num_return_sequences, T)
+x = tokens.to(device)
+
+# generate
+torch.manual_seed(2147483647)
+torch.mps.manual_seed(2147483647)
+
+while x.size(1) < max_length:
+    # forward the model to get logits
+    with torch.no_grad():
+        logits = model(x)                                       # (B, T, vocab_size)
+        # take the logits at the last position
+        logits = logits[:, -1, :]                               # (B, vocab_size)
+        # get the probabilities
+        probs = F.softmax(logits, dim=-1)
+        # top-50 sampling (Hugging Face pipeline default)
+        # topk_probs here becomes (num_return_sequences, k), topk_indices here becomes (num_return_sequences, k)
+        topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
+        # select a token from the top-k probabilities
+        ix = torch.multinomial(topk_probs, 1)                   # (B, 1)
+        # gather the corresponding indices
+        xcol = torch.gather(topk_indices, -1, ix)               # (B, 1)
+        # append to the sequence
+        x = torch.cat((x, xcol), dim=1)
+
+# print the generated text
+for i in range(num_return_sequences):
+    tokens = x[i, :max_length].tolist()
+    decoded = enc.decode(tokens)
+    print('>', decoded, '...\n')
