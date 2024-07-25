@@ -26,6 +26,7 @@ class CausalSelfAttention(nn.Module):
         self.c_attn = nn.Linear(config.n_embd, 3*config.n_embd)
         # output projection
         self.c_proj = nn.Linear(config.n_embd, config.n_embd)
+        self.c_proj.RESOGPT_SCALE_INIT = True
         # regularization
         self.n_head = config.n_head
         self.n_embd = config.n_embd
@@ -65,6 +66,7 @@ class MLP(nn.Module):
         self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd)                 # diverging layer
         self.gelu = nn.GELU(approximate='tanh')                                 # gaussian error linear unit
         self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd)               # converging layer
+        self.c_proj.RESOGPT_SCALE_INIT = True
 
     def forward(self, x):
         x = self.c_fc(x)
@@ -101,6 +103,24 @@ class GPT(nn.Module):
             ln_f = nn.LayerNorm(config.n_embd),                                 # layer normalization
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)  # language modelling head
+
+        # weight sharing scheme
+        self.transformer.wte.weight = self.lm_head.weight
+
+        # parameter initialization
+        self.apply(self._init_weights)
+    
+    def _init_weights(self, module):
+        # weight initialization std=0.02 according to OpenAI GPT-2 implementation
+        std = 0.02
+        if isinstance(module, nn.Linear):
+            if hasattr(module, 'RESOGPT_SCALE_INIT'):
+                std /= (2 * config.n_layer)**0.5
+            nn.init.normal_(module.weight, mean=0.0, std=std)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            nn.init.normal_(module.weight, mean=0.0, std=std)
 
     def forward(self, idx, targets=None):
         # idx is of shape (B, T)
