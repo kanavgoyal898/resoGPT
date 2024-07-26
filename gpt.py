@@ -1,4 +1,6 @@
+from time import time
 from dataclasses import dataclass
+from contextlib import nullcontext
 
 import torch
 import torch.nn as nn
@@ -46,12 +48,9 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)         # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)         # (B, nh, T, hs)
 
-        # attention weights (materializes the large (T, T) matrix for all the queries and keys)
-        att = q @ k.transpose(-2, -1) * (1.0 / k.size(-1)**0.5)
-        att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
-        att = F.softmax(att, dim=-1)
+        # flash attention 
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)             # (B, nh, T, hs)
 
-        y = att @ v                                                             # (B, nh, T, hs)
         # re-assemble all heads outputs side-by-side
         y = y.transpose(1, 2).contiguous().view(B, T, C)
 
@@ -241,24 +240,43 @@ elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
     device = 'mps'
 print(f'using device: {device}')
 
-config = GPTConfig()
+batch_size = 4
+block_size = 1024
+
+# vocab_size padding using nice numbers
+config = GPTConfig(vocab_size=51200)
 model = GPT(config)
-train_loader = DataLoader(4, 32)
+train_loader = DataLoader(batch_size, block_size)
+torch.set_float32_matmul_precision('high')
 
 model.eval()
 model.to(device)
 
+try:
+    model = torch.compile(model)
+except Exception as e:
+    print(f'model compilation error: {e}')
+
 # optimize
 optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
 for i in range(50):
+    t1 = time()
     x, y = train_loader.next_batch()
     x, y = x.to(device), y.to(device)
     
     optimizer.zero_grad(set_to_none=True)
-    logits, loss = model(x, y)
+    with torch.autocast(device, dtype=torch.bfloat16) if device == 'cuda' else nullcontext():
+        logits, loss = model(x, y)
     loss.backward()
     optimizer.step()
-    print(f'step {i+1:2d}, loss: {loss.item():.4f}')
+
+    torch.mps.synchronize()         # wait for the hardware to finish work
+    t2 = time()
+
+    dt = t2 - t1                    # time difference in seconds
+    tokens_per_sec = (batch_size * block_size) / dt
+
+    print(f'step {i+1:2d}, loss: {loss.item():.4f}, dt: {dt*1000:.2f} ms, {tokens_per_sec:.2f} tokens per sec')
 
 import sys
 sys.exit(0)
