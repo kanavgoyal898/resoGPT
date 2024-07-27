@@ -1,4 +1,5 @@
 import math
+import inspect
 
 from time import time
 from dataclasses import dataclass
@@ -145,6 +146,33 @@ class GPT(nn.Module):
         if targets is not None:
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
         return logits, loss
+    
+    def configure_optimizers(self, wd, lr, device):
+        # start with all of the candidate parameters that require grad
+        param_dict = {pn:p for pn, p in self.named_parameters()}
+        param_dict = {pn:p for pn, p in param_dict.items() if p.requires_grad}
+
+        # create optim groups
+        # any parameter that is (<1)-dimensional will be weight-decayed, otherwise no 
+        # i.e., all weight tensors in matrix-multiplications and embeddings decay, while biases and layer-normalizations do not 
+        decay_params = [p for pn, p in param_dict.items() if  p.dim() > 1]
+        nondecay_params = [p for pn, p in param_dict.items() if p.dim() <= 1]
+        optim_groups = [
+            {'params': decay_params, 'weight_decay': wd},
+            {'params': nondecay_params, 'weight_decay': 0.0}
+        ]
+
+        num_decay_params = sum(p.nelement() for p in decay_params)
+        num_nondecay_params = sum(p.nelement() for p in nondecay_params)
+        print(f'number of decay-parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters')
+        print(f'number of non-decay-parameters tensors: {len(nondecay_params)} with {num_nondecay_params:,} parameters')
+
+        # create AdamW optimizer using the fused version, if available
+        use_fused = ('fused' in inspect.signature(torch.optim.AdamW).parameters) and (device in ['cuda', 'xpu', 'privateuseone'])
+        print(f'using fused AdamW optimizer: {use_fused}')
+        optimizer = torch.optim.AdamW(optim_groups, lr, betas=(0.9, 0.95), eps=1e-8, fused=use_fused)
+        return optimizer
+
 
     @classmethod
     def from_pretrained(cls, model_type):
@@ -278,7 +306,8 @@ def get_learning_rate(i, max_lr=6e-4, min_lr=6e-5):
     return min_lr + coeff * (max_lr-min_lr)
 
 # optimize
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
+torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
+optimizer = model.configure_optimizers(wd=0.1, lr=6e-4, device=device)
 for step in range(max_steps):
     t1 = time()
     x, y = train_loader.next_batch()
