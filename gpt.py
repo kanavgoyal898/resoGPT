@@ -270,13 +270,19 @@ elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
     device = 'mps'
 print(f'using device: {device}')
 
-batch_size = 4
-block_size = 1024
+batch_size = 524288     # ~ 0.5M (2^19) tokens (Open AI GPT-3-small hyper-parameters)
+minbatch_size = 4       # mini-batch size
+block_size = 1024       # sequence length
+assert batch_size % (minbatch_size*block_size) == 0, "make sure batch_size is divisible by B*T"
+
+grad_accum_steps = batch_size // (minbatch_size * block_size)
+print(f'total desired batch size: {batch_size}')
+print(f'gradient accumulation steps: {grad_accum_steps}')
 
 # vocab_size padding using nice numbers
 config = GPTConfig(vocab_size=51200)
 model = GPT(config)
-train_loader = DataLoader(batch_size, block_size)
+train_loader = DataLoader(minbatch_size, block_size)
 torch.set_float32_matmul_precision('high')
 
 model.eval()
@@ -310,14 +316,17 @@ torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
 optimizer = model.configure_optimizers(wd=0.1, lr=6e-4, device=device)
 for step in range(max_steps):
     t1 = time()
-    x, y = train_loader.next_batch()
-    x, y = x.to(device), y.to(device)
-    
     optimizer.zero_grad(set_to_none=True)
-    with torch.autocast(device, dtype=torch.bfloat16) if device == 'cuda' else nullcontext():
-        logits, loss = model(x, y)
 
-    loss.backward()
+    loss_accum = 0.0
+    for ministep in range(grad_accum_steps):
+        x, y = train_loader.next_batch()
+        x, y = x.to(device), y.to(device)
+        with torch.autocast(device, dtype=torch.bfloat16) if device == 'cuda' else nullcontext():
+            logits, loss = model(x, y)
+        loss = loss / grad_accum_steps                          # gradient accumulation normalization
+        loss_accum += loss.detach()
+        loss.backward()
     norm = nn.utils.clip_grad_norm_(model.parameters(), 1.0)
 
     # determine and set the learning rate for this iteration
@@ -330,9 +339,10 @@ for step in range(max_steps):
     t2 = time()
 
     dt = t2 - t1                                                # time difference in seconds
-    tokens_per_sec = (batch_size * block_size) / dt
+    tokens_processed = batch_size * block_size * grad_accum_steps
+    tokens_per_sec = tokens_processed / dt
 
-    print(f'step {step:2d}, loss: {loss.item():.6f} | lr: {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f} ms, {tokens_per_sec:.2f} tokens per sec')
+    print(f'step {step:2d}, loss: {loss_accum.item():.6f} | lr: {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f} ms, {tokens_per_sec:.2f} tokens per sec')
 
 import sys
 sys.exit(0)
