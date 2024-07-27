@@ -1,3 +1,5 @@
+import math
+
 from time import time
 from dataclasses import dataclass
 from contextlib import nullcontext
@@ -257,9 +259,27 @@ try:
 except Exception as e:
     print(f'model compilation error: {e}')
 
+max_steps=100
+def get_learning_rate(i, max_lr=6e-4, min_lr=6e-5):
+    decay_steps = int(max_steps * (260/300))            # gpt-3 ratios (260B / 300B)
+    warmup_steps = int(max_steps * (375/300000))        # gpt-3 ratios (375M / 300B)
+
+    # linear warmup for i < warmup_steps iterations
+    if i < warmup_steps:
+        return max_lr * (i+1)/warmup_steps
+    # minimum learning rate for i > decay_steps iterations
+    if i > decay_steps:
+        return min_lr
+    # cosine decay down to minimum learning rate
+    decay_ratio = (i-warmup_steps)/(decay_steps-warmup_steps)
+    assert 0 <= decay_ratio <= 1
+    # coeff starts at 1 and, goes to 0
+    coeff = 0.5 * (1 + math.cos(math.pi*decay_ratio))
+    return min_lr + coeff * (max_lr-min_lr)
+
 # optimize
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
-for i in range(50):
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
+for step in range(max_steps):
     t1 = time()
     x, y = train_loader.next_batch()
     x, y = x.to(device), y.to(device)
@@ -267,16 +287,23 @@ for i in range(50):
     optimizer.zero_grad(set_to_none=True)
     with torch.autocast(device, dtype=torch.bfloat16) if device == 'cuda' else nullcontext():
         logits, loss = model(x, y)
+
     loss.backward()
+    norm = nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+
+    # determine and set the learning rate for this iteration
+    lr = get_learning_rate(step)
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
     optimizer.step()
 
-    torch.mps.synchronize()         # wait for the hardware to finish work
+    torch.mps.synchronize()                                     # wait for the hardware to finish work
     t2 = time()
 
-    dt = t2 - t1                    # time difference in seconds
+    dt = t2 - t1                                                # time difference in seconds
     tokens_per_sec = (batch_size * block_size) / dt
 
-    print(f'step {i+1:2d}, loss: {loss.item():.4f}, dt: {dt*1000:.2f} ms, {tokens_per_sec:.2f} tokens per sec')
+    print(f'step {step:2d}, loss: {loss.item():.6f} | lr: {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f} ms, {tokens_per_sec:.2f} tokens per sec')
 
 import sys
 sys.exit(0)
