@@ -270,7 +270,7 @@ elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
     device = 'mps'
 print(f'using device: {device}')
 
-batch_size = 524288     # ~ 0.5M (2^19) tokens (Open AI GPT-3-small hyper-parameters)
+batch_size = 524288     # ~0.5M (2^19) tokens (OpenAI GPT3-small hyper-parameters)
 minbatch_size = 4       # mini-batch size
 block_size = 1024       # sequence length
 assert batch_size % (minbatch_size*block_size) == 0, "make sure batch_size is divisible by B*T"
@@ -322,6 +322,7 @@ for step in range(max_steps):
     for ministep in range(grad_accum_steps):
         x, y = train_loader.next_batch()
         x, y = x.to(device), y.to(device)
+        # the loss objective is different here, because accumulation in gradient is, equivalent to sum of losses
         with torch.autocast(device, dtype=torch.bfloat16) if device == 'cuda' else nullcontext():
             logits, loss = model(x, y)
         loss = loss / grad_accum_steps                          # gradient accumulation normalization
@@ -335,7 +336,11 @@ for step in range(max_steps):
         param_group['lr'] = lr
     optimizer.step()
 
-    torch.mps.synchronize()                                     # wait for the hardware to finish work
+    # wait for the hardware to finish work
+    if device == 'cuda':
+        torch.cuda.synchronize()
+    elif device == 'mps':
+        torch.mps.synchronize()                                     
     t2 = time()
 
     dt = t2 - t1                                                # time difference in seconds
